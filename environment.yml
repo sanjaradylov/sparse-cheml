@@ -1,0 +1,10 @@
+name: sparse_cheml
+channels:
+  - anaconda
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip
+  - pandas
+  - rdkit
+  - scikit-learn
