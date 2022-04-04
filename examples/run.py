@@ -12,7 +12,7 @@ from scipy import stats
 from sklearn.compose import ColumnTransformer
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.feature_selection import SelectFromModel, VarianceThreshold
-from sklearn.linear_model import ElasticNetCV, HuberRegressor, Ridge
+from sklearn.linear_model import ElasticNetCV, Ridge, SGDRegressor
 from sklearn.model_selection import cross_validate, RandomizedSearchCV, ShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -219,12 +219,13 @@ def create_model_pipe():
 
                 return SelectFromModel(CDRegressor(
                     penalty='l1/l2',
+                    loss='squared',
                     max_iter=100,
                     termination='violation_sum',
                     shrinking=True,
                     debiasing=False,
                     permute=True,
-                    selection='cyclic',
+                    selection='uniform',
 
                     verbose=False,
                     n_jobs=1,
@@ -287,16 +288,33 @@ def create_model_pipe():
 
             if options.predictor == 'huber':
                 param_grid[
-                    f'{options.predictor}__epsilon'
-                ] = stats.uniform(1, 2)
+                    f'{options.predictor}__average'
+                ] = (False, True)
                 param_grid[
                     f'{options.predictor}__tol'
-                ] = stats.uniform(1e-4, 1e-1)
+                ] = stats.uniform(1e-4, 1e-2)
+                param_grid[
+                    f'{options.predictor}__alpha'
+                ] = stats.uniform(1e-7, 1e-3)
+                param_grid[
+                    f'{options.predictor}__epsilon'
+                ] = stats.uniform(0, 3 * y.std())
 
-                return HuberRegressor(max_iter=1_000)
+                return SGDRegressor(
+                    loss='huber',
+                    penalty='l2',
+                    max_iter=500,
+                    learning_rate='optimal',
+
+                    random_state=random_state,
+                )
 
             elif options.predictor == 'ols':
-                return Ridge(alpha=1e-7, solver='cholesky')
+                param_grid[
+                    f'{options.predictor}__alpha'
+                ] = stats.uniform(1e-7, 1e-3)
+
+                return Ridge(solver='cholesky')
 
     pipe = Pipeline(
         steps=[
