@@ -5,17 +5,24 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from group_lasso import GroupLasso
-from groupyr import SGLCV
-from lightning.regression import CDRegressor
 from scipy import stats
+
+from group_lasso import LogisticGroupLasso, GroupLasso
+from groupyr import LogisticSGLCV, SGLCV
+from lightning.classification import CDClassifier
+from lightning.regression import CDRegressor
+
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.feature_selection import SelectFromModel, VarianceThreshold
-from sklearn.linear_model import ElasticNetCV, Ridge, SGDRegressor
+from sklearn.linear_model import (
+    ElasticNetCV, LogisticRegression, LogisticRegressionCV,
+    Ridge, RidgeClassifier, SGDRegressor)
 from sklearn.model_selection import cross_validate, RandomizedSearchCV, ShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import l1_min_c
 
 from sparse_cheml.feature_extraction import create_feature_space
 from sparse_cheml.model_selection import ScaffoldKFold
@@ -63,7 +70,7 @@ def process_options():
     task_options.add_argument(
         '-p', '--predictor',
         help='Dense model for predictions',
-        choices=('huber', 'ols', 'maxent'),
+        choices=('huber', 'ridge', 'maxent'),
         default='huber',
     )
     task_options.add_argument(
@@ -175,7 +182,7 @@ def create_model_pipe():
         ]
         if options.selector in {'enet', 'lightning'}:
             transformers.append(
-                ('ecfp', VarianceThreshold(0.02 * (1 - 0.02)), boolean_features)
+                ('ecfp', VarianceThreshold(0.015 * (1 - 0.015)), boolean_features)
             )
         return ColumnTransformer(
             transformers=transformers,
@@ -283,6 +290,113 @@ def create_model_pipe():
                     supress_warning=True,
                 )
 
+        elif options.task == 'classification':
+
+            if options.selector == 'enet':
+                param_grid[
+                    f'{options.selector}__threshold'
+                ] = stats.uniform(1e-4, 1e-2)
+                param_grid[
+                    f'{options.selector}__estimator__tol'
+                ] = stats.uniform(1e-4, 1e-1)
+
+                X_tr = get_preprocessing().fit_transform(X)
+                C_min_approx = l1_min_c(X_tr, y, loss='log')
+
+                return SelectFromModel(LogisticRegressionCV(
+                    solver='saga',
+                    penalty='elasticnet',
+                    Cs=np.linspace(C_min_approx, C_min_approx * 100,
+                                   max(2, options.n_rounds // 5)),
+                    l1_ratios=stats.beta(0.6, 0.4).rvs(max(1, options.n_rounds//10)),
+                    max_iter=500,
+                    cv=inner_cv,
+                    scoring=get_metric(options.metric_val),
+
+                    random_state=random_state,
+                    n_jobs=1,
+                ))
+
+            elif options.selector == 'lightning':
+                param_grid[
+                    f'{options.selector}__threshold'
+                ] = stats.uniform(1e-4, 1e-2)
+                param_grid[
+                    f'{options.selector}__estimator__tol'
+                ] = stats.uniform(1e-4, 1e-1)
+
+                X_tr = get_preprocessing().fit_transform(X)
+                C_min_approx = l1_min_c(X_tr, y, loss='log')
+
+                param_grid[
+                    f'{options.selector}__estimator__C'
+                ] = np.linspace(C_min_approx, C_min_approx * 100,
+                                max(2, options.n_rounds // 5))
+
+                return SelectFromModel(CDClassifier(
+                    penalty='l1/l2',
+                    loss='log',
+                    max_iter=100,
+                    termination='violation_sum',
+                    shrinking=True,
+                    debiasing=False,
+                    permute=True,
+                    selection='uniform',
+
+                    verbose=False,
+                    n_jobs=1,
+                    random_state=0,
+                ))
+
+            elif options.selector == 'groupyr':
+                param_grid[
+                    f'{options.selector}__threshold'
+                ] = stats.uniform(1e-3, 1e-1)
+                param_grid[
+                    f'{options.selector}__estimator__tol'
+                ] = stats.uniform(1e-4, 1e-1)
+                param_grid[
+                    f'{options.selector}__estimator__scale_l2_by'
+                ] = ('group_length', None)
+
+                return SelectFromModel(LogisticSGLCV(
+                    groups=make_groups_groupyr(features),
+                    l1_ratio=stats.uniform(0, 1).rvs(max(1, options.n_rounds//10)),
+                    eps=5e-3,
+                    n_alphas=max(2, options.n_rounds // 5),
+                    max_iter=200,
+                    cv=inner_cv,
+                    scoring=get_metric(options.metric_val),
+                    tuning_strategy='grid',
+
+                    verbose=False,
+                    n_jobs=options.n_jobs,
+                    random_state=random_state,
+                    suppress_solver_warnings=True,
+                ))
+
+            elif options.selector == 'sgl':
+                param_grid[
+                    f'{options.selector}__group_reg'
+                ] = stats.uniform(1e-2, 1e-1)
+                param_grid[
+                    f'{options.selector}__l1_reg'
+                ] = stats.uniform(1e-2, 1e-1)
+                param_grid[
+                    f'{options.selector}__tol'
+                ] = stats.uniform(1e-4, 1e-1)
+                param_grid[
+                    f'{options.selector}__scale_reg'
+                ] = ('group_size', 'none', 'inverse_group_size')
+
+                return LogisticGroupLasso(
+                    groups=make_groups_group_lasso(features),
+                    n_iter=200,
+
+                    random_state=random_state,
+                    supress_warning=True,
+                )
+
     def get_predictor():
         if options.task == 'regression':
 
@@ -309,12 +423,50 @@ def create_model_pipe():
                     random_state=random_state,
                 )
 
-            elif options.predictor == 'ols':
+            elif options.predictor == 'ridge':
                 param_grid[
                     f'{options.predictor}__alpha'
                 ] = stats.uniform(1e-7, 1e-3)
 
                 return Ridge(solver='cholesky')
+
+        elif options.task == 'classification':
+
+            if options.predictor == 'maxent':
+                param_grid[
+                    f'{options.predictor}__tol'
+                ] = stats.uniform(1e-4, 1e-1)
+                param_grid[
+                    f'{options.predictor}__C'
+                ] = stats.uniform(1e3, 1e7)
+
+                predictor = LogisticRegression(
+                    solver='lbfgs',
+                    penalty='l2',
+                    max_iter=200,
+
+                    random_state=random_state,
+                    n_jobs=1,
+                )
+
+            elif options.predictor == 'ridge':
+                param_grid[
+                    f'{options.predictor}__alpha'
+                ] = stats.uniform(1e-7, 1e-3)
+
+                predictor = RidgeClassifier(solver='cholesky')
+
+            if options.calibrate:
+                predictor = CalibratedClassifierCV(
+                    base_estimator=predictor,
+                    method='sigmoid',
+                    cv=inner_cv,
+                    ensemble=False,
+
+                    n_jobs=options.n_jobs,
+                )
+
+            return predictor
 
     pipe = Pipeline(
         steps=[
