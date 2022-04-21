@@ -130,6 +130,11 @@ def process_options():
         default=1,
     )
     other_options.add_argument(
+        '-f', '--checkpoint',
+        help='Path to save serialized models',
+        default='checkpoint',
+    )
+    other_options.add_argument(
         '-h', '--help',
         help='Show this help message and exit',
         action='help',
@@ -207,7 +212,7 @@ def create_model_pipe():
                     l1_ratio=stats.beta(0.6, 0.4).rvs(max(1, options.n_rounds//10)),
                     eps=5e-3,
                     n_alphas=max(1, options.n_rounds // 5),
-                    max_iter=200,
+                    max_iter=500,
                     cv=inner_cv,
                     random_state=random_state,
                     selection='random',
@@ -227,7 +232,7 @@ def create_model_pipe():
                 return SelectFromModel(CDRegressor(
                     penalty='l1/l2',
                     loss='squared',
-                    max_iter=100,
+                    max_iter=200,
                     termination='violation_sum',
                     shrinking=True,
                     debiasing=False,
@@ -336,7 +341,7 @@ def create_model_pipe():
                 return SelectFromModel(CDClassifier(
                     penalty='l1/l2',
                     loss='log',
-                    max_iter=100,
+                    max_iter=200,
                     termination='violation_sum',
                     shrinking=True,
                     debiasing=False,
@@ -506,6 +511,17 @@ def evaluate():
                                 return_estimator=True,
                                 error_score=np.nan,
                                 verbose=options.verbose)
+
+    def save_models():
+        root = pathlib.Path(options.checkpoint)
+        root.mkdir(exist_ok=True)
+        model_paths = [
+            dump(model, f'{root / model.__class__.__name__}_{no}.joblib')
+            for no, model in enumerate(cv_results['estimator'])
+        ]
+        assert all(pathlib.Path(path[0]).exists() for path in model_paths)
+
+    save_models()
 
     mean_train_score = cv_results['train_score'].mean()
     std_train_score = cv_results['train_score'].std()
