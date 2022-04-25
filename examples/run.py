@@ -1,10 +1,12 @@
 #! /usr/bin/env python
 
 import argparse
+import pathlib
 import warnings
 
 import numpy as np
 import pandas as pd
+from joblib import dump
 from scipy import stats
 
 from group_lasso import LogisticGroupLasso, GroupLasso
@@ -17,16 +19,16 @@ from sklearn.compose import ColumnTransformer
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.feature_selection import SelectFromModel, VarianceThreshold
 from sklearn.linear_model import (
-    ElasticNetCV, LogisticRegression, LogisticRegressionCV,
+    ElasticNetCV, LogisticRegression,
     Ridge, RidgeClassifier, SGDRegressor)
 from sklearn.model_selection import cross_validate, RandomizedSearchCV, ShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.svm import l1_min_c
 
 from sparse_cheml.feature_extraction import create_feature_space
 from sparse_cheml.model_selection import ScaffoldKFold
-from sparse_cheml.preprocessing import make_groups_groupyr, make_groups_group_lasso
+from sparse_cheml.preprocessing import (
+    check_compounds_valid, make_groups_groupyr, make_groups_group_lasso)
 
 
 def process_options():
@@ -209,9 +211,9 @@ def create_model_pipe():
                 ] = stats.uniform(1e-4, 1e-1)
 
                 return SelectFromModel(ElasticNetCV(
-                    l1_ratio=stats.beta(0.6, 0.4).rvs(max(1, options.n_rounds//10)),
-                    eps=5e-3,
-                    n_alphas=max(1, options.n_rounds // 5),
+                    l1_ratio=stats.beta(0.6, 0.4).rvs(max(1, options.n_rounds // 5)),
+                    eps=1e-2,
+                    n_alphas=max(1, options.n_rounds // 3),
                     max_iter=500,
                     cv=inner_cv,
                     random_state=random_state,
@@ -304,19 +306,17 @@ def create_model_pipe():
                 param_grid[
                     f'{options.selector}__estimator__tol'
                 ] = stats.uniform(1e-4, 1e-1)
+                param_grid[
+                    f'{options.selector}__estimator__C'
+                ] = 10. ** np.arange(-3, 4, 10/options.n_rounds)
+                param_grid[
+                    f'{options.selector}__estimator__l1_ratio'
+                ] = stats.beta(0.6, 0.4)
 
-                X_tr = get_preprocessing().fit_transform(X)
-                C_min_approx = l1_min_c(X_tr, y, loss='log')
-
-                return SelectFromModel(LogisticRegressionCV(
+                return SelectFromModel(LogisticRegression(
                     solver='saga',
                     penalty='elasticnet',
-                    Cs=np.linspace(C_min_approx, C_min_approx * 100,
-                                   max(2, options.n_rounds // 5)),
-                    l1_ratios=stats.beta(0.6, 0.4).rvs(max(1, options.n_rounds//10)),
                     max_iter=500,
-                    cv=inner_cv,
-                    scoring=get_metric(options.metric_val),
 
                     random_state=random_state,
                     n_jobs=1,
@@ -329,14 +329,9 @@ def create_model_pipe():
                 param_grid[
                     f'{options.selector}__estimator__tol'
                 ] = stats.uniform(1e-4, 1e-1)
-
-                X_tr = get_preprocessing().fit_transform(X)
-                C_min_approx = l1_min_c(X_tr, y, loss='log')
-
                 param_grid[
                     f'{options.selector}__estimator__C'
-                ] = np.linspace(C_min_approx, C_min_approx * 100,
-                                max(2, options.n_rounds // 5))
+                ] = 10. ** np.arange(-3, 4, 10/options.n_rounds)
 
                 return SelectFromModel(CDClassifier(
                     penalty='l1/l2',
@@ -356,7 +351,7 @@ def create_model_pipe():
             elif options.selector == 'groupyr':
                 param_grid[
                     f'{options.selector}__threshold'
-                ] = stats.uniform(1e-3, 1e-1)
+                ] = stats.uniform(1e-4, 1e-2)
                 param_grid[
                     f'{options.selector}__estimator__tol'
                 ] = stats.uniform(1e-4, 1e-1)
@@ -366,9 +361,9 @@ def create_model_pipe():
 
                 return SelectFromModel(LogisticSGLCV(
                     groups=make_groups_groupyr(features),
-                    l1_ratio=stats.uniform(0, 1).rvs(max(1, options.n_rounds//10)),
-                    eps=5e-3,
-                    n_alphas=max(2, options.n_rounds // 5),
+                    l1_ratio=stats.uniform(0, 1).rvs(max(1, options.n_rounds // 5)),
+                    eps=1e-2,
+                    n_alphas=max(2, options.n_rounds // 3),
                     max_iter=200,
                     cv=inner_cv,
                     scoring=get_metric(options.metric_val),
@@ -503,9 +498,17 @@ def evaluate():
     warnings.filterwarnings('ignore', category=UserWarning, module='joblib')
     warnings.filterwarnings('ignore', category=ConvergenceWarning, module='sklearn')
 
+    if options.cv == 'scaffold':
+        X_smiles = pd.read_csv(options.csv, usecols=[options.smiles_field],
+                               squeeze=True)
+        X_mol = check_compounds_valid(X_smiles)
+        cv = outer_cv.split(X_mol)
+    else:
+        cv = outer_cv
+
     cv_results = cross_validate(model, X, y,
                                 scoring=get_metric(options.metric_test),
-                                cv=outer_cv,
+                                cv=cv,
                                 n_jobs=options.n_jobs,
                                 return_train_score=True,
                                 return_estimator=True,
