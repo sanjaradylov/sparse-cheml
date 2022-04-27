@@ -1,7 +1,6 @@
 #! /usr/bin/env python
 
 import argparse
-import pathlib
 import warnings
 
 import numpy as np
@@ -130,11 +129,6 @@ def process_options():
         help='Number of parallel jobs [validation]',
         type=int,
         default=1,
-    )
-    other_options.add_argument(
-        '-f', '--checkpoint',
-        help='Path to save serialized models',
-        default='checkpoint',
     )
     other_options.add_argument(
         '-h', '--help',
@@ -514,17 +508,7 @@ def evaluate():
                                 return_estimator=True,
                                 error_score=np.nan,
                                 verbose=options.verbose)
-
-    def save_models():
-        root = pathlib.Path(options.checkpoint)
-        root.mkdir(exist_ok=True)
-        model_paths = [
-            dump(model, f'{root / model.__class__.__name__}_{no}.joblib')
-            for no, model in enumerate(cv_results['estimator'])
-        ]
-        assert all(pathlib.Path(path[0]).exists() for path in model_paths)
-
-    save_models()
+    dump(cv_results, f'{options.selector}-cv.pkl')
 
     mean_train_score = cv_results['train_score'].mean()
     std_train_score = cv_results['train_score'].std()
