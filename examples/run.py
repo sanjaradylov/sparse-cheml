@@ -1,12 +1,17 @@
 #! /usr/bin/env python
 
 import argparse
+import pathlib
 import warnings
 
 import numpy as np
 import pandas as pd
 from joblib import dump
 from scipy import stats
+
+from optuna.distributions import (
+    CategoricalDistribution, IntUniformDistribution, UniformDistribution)
+from optuna.integration import OptunaSearchCV
 
 from group_lasso import LogisticGroupLasso, GroupLasso
 from groupyr import LogisticSGLCV, SGLCV
@@ -16,11 +21,12 @@ from lightning.regression import CDRegressor
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.feature_selection import SelectFromModel, VarianceThreshold
+from sklearn.feature_selection import SelectFromModel
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import (
     ElasticNetCV, LogisticRegression,
     Ridge, RidgeClassifier, SGDRegressor)
-from sklearn.model_selection import cross_validate, RandomizedSearchCV, ShuffleSplit
+from sklearn.model_selection import cross_validate, ShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -175,16 +181,14 @@ def create_model_pipe():
     features = pd.Series(X.columns)
     feature_mask = features.apply(lambda f: 'ecfp' not in f)
     numeric_features = features[feature_mask]
-    boolean_features = features[~feature_mask]
 
     def get_preprocessing():
+        imputer = SimpleImputer(strategy='mean')
+        scaler = StandardScaler(with_mean=False)
+        num_tr = Pipeline([('impute', imputer), ('scale', scaler)])
         transformers = [
-            ('desc', StandardScaler(with_mean=False), numeric_features),
+            ('desc', num_tr, numeric_features),
         ]
-        if options.selector in {'enet', 'lightning'}:
-            transformers.append(
-                ('ecfp', VarianceThreshold(0.015 * (1 - 0.015)), boolean_features)
-            )
         return ColumnTransformer(
             transformers=transformers,
             remainder='passthrough',
@@ -199,15 +203,15 @@ def create_model_pipe():
             if options.selector == 'enet':
                 param_grid[
                     f'{options.selector}__threshold'
-                ] = stats.uniform(1e-4, 1e-2)
+                ] = UniformDistribution(1e-4, 1e-2)
                 param_grid[
                     f'{options.selector}__estimator__tol'
-                ] = stats.uniform(1e-4, 1e-1)
+                ] = UniformDistribution(1e-4, 1e-1)
 
                 return SelectFromModel(ElasticNetCV(
-                    l1_ratio=stats.beta(0.6, 0.4).rvs(max(1, options.n_rounds // 5)),
-                    eps=1e-2,
-                    n_alphas=max(1, options.n_rounds // 3),
+                    l1_ratio=stats.beta(0.6, 0.4).rvs(max(1, options.n_rounds // 3)),
+                    eps=5e-3,
+                    n_alphas=max(2, options.n_rounds // 3),
                     max_iter=500,
                     cv=inner_cv,
                     random_state=random_state,
@@ -217,13 +221,25 @@ def create_model_pipe():
             elif options.selector == 'lightning':
                 param_grid[
                     f'{options.selector}__threshold'
-                ] = stats.uniform(1e-4, 1e-2)
+                ] = UniformDistribution(1e-4, 1e-3)
                 param_grid[
                     f'{options.selector}__estimator__tol'
-                ] = stats.uniform(1e-4, 1e-1)
+                ] = UniformDistribution(1e-3, 1e-1)
                 param_grid[
                     f'{options.selector}__estimator__C'
-                ] = stats.gamma(2., 0.75)
+                ] = UniformDistribution(1e-4, 1e+4)
+                param_grid[
+                    f'{options.selector}__estimator__alpha'
+                ] = UniformDistribution(1e-4, 1e+4)
+                param_grid[
+                    f'{options.selector}__estimator__max_steps'
+                ] = IntUniformDistribution(10, 30, 5)
+                param_grid[
+                    f'{options.selector}__estimator__beta'
+                ] = UniformDistribution(0.2, 0.9)
+                param_grid[
+                    f'{options.selector}__estimator__sigma'
+                ] = UniformDistribution(1e-3, 1e-2)
 
                 return SelectFromModel(CDRegressor(
                     penalty='l1/l2',
@@ -243,20 +259,20 @@ def create_model_pipe():
             elif options.selector == 'groupyr':
                 param_grid[
                     f'{options.selector}__threshold'
-                ] = stats.uniform(1e-3, 1e-1)
+                ] = UniformDistribution(1e-3, 1e-1)
                 param_grid[
                     f'{options.selector}__estimator__tol'
-                ] = stats.uniform(1e-4, 1e-1)
+                ] = UniformDistribution(1e-4, 1e-2)
                 param_grid[
                     f'{options.selector}__estimator__scale_l2_by'
-                ] = ('group_length', None)
+                ] = CategoricalDistribution(('group_length', None))
 
                 return SelectFromModel(SGLCV(
                     groups=make_groups_groupyr(features),
-                    l1_ratio=stats.uniform(0, 1).rvs(max(1, options.n_rounds//10)),
-                    eps=5e-3,
-                    n_alphas=max(1, options.n_rounds // 5),
-                    max_iter=100,
+                    l1_ratio=stats.uniform(0, 1).rvs(max(1, options.n_rounds // 3)),
+                    eps=1e-3,
+                    n_alphas=max(1, options.n_rounds // 3),
+                    max_iter=200,
                     cv=inner_cv,
                     tuning_strategy='grid',
 
@@ -269,23 +285,27 @@ def create_model_pipe():
             elif options.selector == 'sgl':
                 param_grid[
                     f'{options.selector}__group_reg'
-                ] = stats.uniform(1e-2, 1e-1)
+                ] = UniformDistribution(5e-3, 1e-1)
                 param_grid[
                     f'{options.selector}__l1_reg'
-                ] = stats.uniform(1e-2, 1e-1)
+                ] = UniformDistribution(5e-3, 1e-1)
                 param_grid[
                     f'{options.selector}__tol'
-                ] = stats.uniform(1e-4, 1e-1)
+                ] = UniformDistribution(1e-3, 1e-1)
                 param_grid[
                     f'{options.selector}__scale_reg'
-                ] = ('group_size', 'none', 'inverse_group_size')
+                ] = CategoricalDistribution(
+                    ('group_size', 'none', 'inverse_group_size'))
                 param_grid[
                     f'{options.selector}__frobenius_lipschitz'
-                ] = (True, False)
+                ] = CategoricalDistribution((True, False))
+                param_grid[
+                    f'{options.selector}__subsampling_scheme'
+                ] = UniformDistribution(0.64, 1.0)
 
                 return GroupLasso(
                     groups=make_groups_group_lasso(features),
-                    n_iter=100,
+                    n_iter=200,
 
                     random_state=random_state,
                     supress_warning=True,
@@ -296,16 +316,16 @@ def create_model_pipe():
             if options.selector == 'enet':
                 param_grid[
                     f'{options.selector}__threshold'
-                ] = stats.uniform(1e-4, 1e-2)
+                ] = UniformDistribution(1e-4, 1e-2)
                 param_grid[
                     f'{options.selector}__estimator__tol'
-                ] = stats.uniform(1e-4, 1e-1)
+                ] = UniformDistribution(1e-4, 1e-1)
                 param_grid[
                     f'{options.selector}__estimator__C'
-                ] = 10. ** np.arange(-3, 4, 10/options.n_rounds)
+                ] = UniformDistribution(1e-4, 1e+4)
                 param_grid[
                     f'{options.selector}__estimator__l1_ratio'
-                ] = stats.beta(0.6, 0.4)
+                ] = UniformDistribution(0.001, 0.99)
 
                 return SelectFromModel(LogisticRegression(
                     solver='saga',
@@ -319,13 +339,25 @@ def create_model_pipe():
             elif options.selector == 'lightning':
                 param_grid[
                     f'{options.selector}__threshold'
-                ] = stats.uniform(1e-4, 1e-2)
+                ] = UniformDistribution(1e-4, 1e-3)
                 param_grid[
                     f'{options.selector}__estimator__tol'
-                ] = stats.uniform(1e-4, 1e-1)
+                ] = UniformDistribution(1e-3, 1e-1)
                 param_grid[
                     f'{options.selector}__estimator__C'
-                ] = 10. ** np.arange(-3, 4, 10/options.n_rounds)
+                ] = UniformDistribution(1e-4, 1e+4)
+                param_grid[
+                    f'{options.selector}__estimator__alpha'
+                ] = UniformDistribution(1e-4, 1e+4)
+                param_grid[
+                    f'{options.selector}__estimator__max_steps'
+                ] = IntUniformDistribution(10, 30, 5)
+                param_grid[
+                    f'{options.selector}__estimator__beta'
+                ] = UniformDistribution(0.2, 0.9)
+                param_grid[
+                    f'{options.selector}__estimator__sigma'
+                ] = UniformDistribution(1e-3, 1e-2)
 
                 return SelectFromModel(CDClassifier(
                     penalty='l1/l2',
@@ -345,23 +377,24 @@ def create_model_pipe():
             elif options.selector == 'groupyr':
                 param_grid[
                     f'{options.selector}__threshold'
-                ] = stats.uniform(1e-4, 1e-2)
+                ] = UniformDistribution(1e-4, 1e-2)
                 param_grid[
                     f'{options.selector}__estimator__tol'
-                ] = stats.uniform(1e-4, 1e-1)
+                ] = UniformDistribution(1e-3, 1e-1)
                 param_grid[
                     f'{options.selector}__estimator__scale_l2_by'
-                ] = ('group_length', None)
+                ] = CategoricalDistribution(('group_length', None))
 
                 return SelectFromModel(LogisticSGLCV(
                     groups=make_groups_groupyr(features),
-                    l1_ratio=stats.uniform(0, 1).rvs(max(1, options.n_rounds // 5)),
-                    eps=1e-2,
+                    l1_ratio=stats.uniform(0, 1).rvs(max(2, options.n_rounds // 3)),
+                    eps=1e-3,
                     n_alphas=max(2, options.n_rounds // 3),
                     max_iter=200,
                     cv=inner_cv,
                     scoring=get_metric(options.metric_val),
-                    tuning_strategy='grid',
+                    tuning_strategy='bayes',
+                    n_bayes_iter=15,
 
                     verbose=False,
                     n_jobs=options.n_jobs,
@@ -372,16 +405,17 @@ def create_model_pipe():
             elif options.selector == 'sgl':
                 param_grid[
                     f'{options.selector}__group_reg'
-                ] = stats.uniform(1e-2, 1e-1)
+                ] = UniformDistribution(5e-5, 5e-3)
                 param_grid[
                     f'{options.selector}__l1_reg'
-                ] = stats.uniform(1e-2, 1e-1)
+                ] = UniformDistribution(5e-5, 5e-3)
                 param_grid[
                     f'{options.selector}__tol'
-                ] = stats.uniform(1e-4, 1e-1)
+                ] = UniformDistribution(1e-3, 1e-2)
                 param_grid[
                     f'{options.selector}__scale_reg'
-                ] = ('group_size', 'none', 'inverse_group_size')
+                ] = CategoricalDistribution(('group_size', 'none',
+                                             'inverse_group_size'))
 
                 return LogisticGroupLasso(
                     groups=make_groups_group_lasso(features),
@@ -397,16 +431,16 @@ def create_model_pipe():
             if options.predictor == 'huber':
                 param_grid[
                     f'{options.predictor}__average'
-                ] = (False, True)
+                ] = CategoricalDistribution((False, True))
                 param_grid[
                     f'{options.predictor}__tol'
-                ] = stats.uniform(1e-4, 1e-2)
+                ] = UniformDistribution(1e-4, 1e-2)
                 param_grid[
                     f'{options.predictor}__alpha'
-                ] = stats.uniform(1e-7, 1e-3)
+                ] = UniformDistribution(1e-7, 1e-3)
                 param_grid[
                     f'{options.predictor}__epsilon'
-                ] = stats.uniform(0, 3 * y.std())
+                ] = UniformDistribution(0, 3 * y.std())
 
                 return SGDRegressor(
                     loss='huber',
@@ -420,7 +454,7 @@ def create_model_pipe():
             elif options.predictor == 'ridge':
                 param_grid[
                     f'{options.predictor}__alpha'
-                ] = stats.uniform(1e-7, 1e-3)
+                ] = UniformDistribution(1e-7, 1e-3)
 
                 return Ridge(solver='cholesky')
 
@@ -429,36 +463,40 @@ def create_model_pipe():
             if options.predictor == 'maxent':
                 param_grid[
                     f'{options.predictor}__tol'
-                ] = stats.uniform(1e-4, 1e-1)
+                ] = UniformDistribution(1e-4, 1e-1)
                 param_grid[
                     f'{options.predictor}__C'
-                ] = stats.uniform(1e3, 1e7)
+                ] = UniformDistribution(1e-2, 1e+7)
 
                 predictor = LogisticRegression(
                     solver='lbfgs',
                     penalty='l2',
-                    max_iter=200,
+                    max_iter=500,
 
                     random_state=random_state,
                     n_jobs=1,
                 )
 
             elif options.predictor == 'ridge':
-                param_grid[
-                    f'{options.predictor}__alpha'
-                ] = stats.uniform(1e-7, 1e-3)
-
                 predictor = RidgeClassifier(solver='cholesky')
 
-            if options.calibrate:
-                predictor = CalibratedClassifierCV(
-                    base_estimator=predictor,
-                    method='sigmoid',
-                    cv=inner_cv,
-                    ensemble=False,
+                if options.calibrate:
+                    predictor = CalibratedClassifierCV(
+                        base_estimator=predictor,
+                        method='sigmoid',
+                        cv=inner_cv.n_splits,
+                        ensemble=False,
 
-                    n_jobs=options.n_jobs,
-                )
+                        n_jobs=options.n_jobs,
+                    )
+
+                    param_grid[
+                        f'{options.predictor}__base_estimator__alpha'
+                    ] = UniformDistribution(1e-7, 1e-3)
+                else:
+                    param_grid[
+                        f'{options.predictor}__alpha'
+                    ] = UniformDistribution(1e-5, 1e-1)
 
             return predictor
 
@@ -471,14 +509,14 @@ def create_model_pipe():
         memory=None,
         verbose=False,
     )
-    search = RandomizedSearchCV(
+    search = OptunaSearchCV(
         pipe,
         param_grid,
-        n_iter=options.n_rounds,
+        max_iter=options.n_rounds,
         scoring=get_metric(options.metric_val),
-        n_jobs=options.n_jobs,
         refit=True,
         cv=inner_cv,
+        n_trials=max(15, options.n_rounds // 10),
         random_state=random_state,
         error_score=np.nan,
         return_train_score=False,
@@ -493,8 +531,8 @@ def evaluate():
     warnings.filterwarnings('ignore', category=ConvergenceWarning, module='sklearn')
 
     if options.cv == 'scaffold':
-        X_smiles = pd.read_csv(options.csv, usecols=[options.smiles_field],
-                               squeeze=True)
+        X_smiles = pd.read_csv(options.csv,
+                               usecols=[options.smiles_field]).squeeze('columns')
         X_mol = check_compounds_valid(X_smiles)
         cv = outer_cv.split(X_mol)
     else:
@@ -508,7 +546,9 @@ def evaluate():
                                 return_estimator=True,
                                 error_score=np.nan,
                                 verbose=options.verbose)
-    dump(cv_results, f'{options.selector}-cv.pkl')
+
+    data_name = pathlib.PurePath(options.csv).stem
+    dump(cv_results, f'{data_name}-{options.selector}-cv.pkl')
 
     mean_train_score = cv_results['train_score'].mean()
     std_train_score = cv_results['train_score'].std()
