@@ -24,7 +24,7 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.feature_selection import SelectFromModel
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import (
-    ElasticNetCV, LogisticRegression,
+    ElasticNetCV, HuberRegressor, LogisticRegression,
     Ridge, RidgeClassifier, SGDRegressor)
 from sklearn.model_selection import cross_validate, ShuffleSplit
 from sklearn.pipeline import Pipeline
@@ -77,8 +77,8 @@ def process_options():
     task_options.add_argument(
         '-p', '--predictor',
         help='Dense model for predictions',
-        choices=('huber', 'ridge', 'maxent'),
-        default='huber',
+        choices=('huber_sgd', 'huber_lbfgsb', 'ridge', 'maxent'),
+        default='huber_sgd',
     )
     task_options.add_argument(
         '-a', '--calibrate',
@@ -96,13 +96,13 @@ def process_options():
     testing_options.add_argument(
         '-e', '--metric_val',
         help='Evaluation metric [validation]',
-        choices=('mae', 'rmse', 'roc'),
+        choices=('mae', 'rmse', 'medae', 'roc'),
         default='rmse',
     )
     testing_options.add_argument(
         '-E', '--metric_test',
         help='Evaluation metric [testing]',
-        choices=('mae', 'rmse', 'roc'),
+        choices=('mae', 'rmse', 'medae', 'roc'),
         default='rmse',
     )
     testing_options.add_argument(
@@ -158,20 +158,22 @@ def create_cvs():
     if options.cv == 'scaffold':
         outer_cv = ScaffoldKFold(n_splits=options.n_splits_test)
         inner_cv = ShuffleSplit(n_splits=options.n_splits_val,
-                                test_size=0.1, random_state=random_state)
+                                test_size=0.2, random_state=random_state)
     else:
         outer_cv = ShuffleSplit(n_splits=options.n_splits_test,
                                 test_size=0.1, random_state=random_state)
         inner_cv = ShuffleSplit(n_splits=options.n_splits_val,
-                                test_size=0.1/0.9, random_state=random_state)
+                                test_size=0.2, random_state=random_state)
 
     return outer_cv, inner_cv
 
 
 def get_metric(metric):
-    valid_metrics = ('mae', 'rmse', 'roc')
+    valid_metrics = ('mae', 'rmse', 'medae', 'roc')
     sklearn_metrics = ('neg_mean_absolute_error',
-                       'neg_root_mean_squared_error', 'roc_auc')
+                       'neg_root_mean_squared_error',
+                       'neg_median_absolute_error',
+                       'roc_auc')
     return dict(zip(valid_metrics, sklearn_metrics))[metric]
 
 
@@ -209,7 +211,7 @@ def create_model_pipe():
                 ] = UniformDistribution(1e-4, 1e-1)
 
                 return SelectFromModel(ElasticNetCV(
-                    l1_ratio=stats.beta(0.6, 0.4).rvs(max(1, options.n_rounds // 3)),
+                    l1_ratio=stats.beta(0.6, 0.4).rvs(max(2, options.n_rounds // 3)),
                     eps=5e-3,
                     n_alphas=max(2, options.n_rounds // 3),
                     max_iter=500,
@@ -221,7 +223,7 @@ def create_model_pipe():
             elif options.selector == 'lightning':
                 param_grid[
                     f'{options.selector}__threshold'
-                ] = UniformDistribution(1e-4, 1e-3)
+                ] = UniformDistribution(1e-4, 1e-2)
                 param_grid[
                     f'{options.selector}__estimator__tol'
                 ] = UniformDistribution(1e-3, 1e-1)
@@ -269,15 +271,18 @@ def create_model_pipe():
 
                 return SelectFromModel(SGLCV(
                     groups=make_groups_groupyr(features),
-                    l1_ratio=stats.uniform(0, 1).rvs(max(1, options.n_rounds // 3)),
+                    l1_ratio=stats.uniform(0, 1).rvs(max(2, options.n_rounds // 3)),
                     eps=1e-3,
-                    n_alphas=max(1, options.n_rounds // 3),
+                    n_alphas=max(2, options.n_rounds // 3),
                     max_iter=200,
                     cv=inner_cv,
-                    tuning_strategy='grid',
+                    tuning_strategy='bayes',
+                    scoring=get_metric(options.metric_val),
 
                     verbose=False,
                     n_jobs=options.n_jobs,
+                    n_bayes_iter=20,
+                    n_bayes_points=10,
                     random_state=random_state,
                     suppress_solver_warnings=True,
                 ))
@@ -285,10 +290,10 @@ def create_model_pipe():
             elif options.selector == 'sgl':
                 param_grid[
                     f'{options.selector}__group_reg'
-                ] = UniformDistribution(5e-3, 1e-1)
+                ] = UniformDistribution(5e-3, 5e-2)
                 param_grid[
                     f'{options.selector}__l1_reg'
-                ] = UniformDistribution(5e-3, 1e-1)
+                ] = UniformDistribution(5e-3, 5e-2)
                 param_grid[
                     f'{options.selector}__tol'
                 ] = UniformDistribution(1e-3, 1e-1)
@@ -428,10 +433,7 @@ def create_model_pipe():
     def get_predictor():
         if options.task == 'regression':
 
-            if options.predictor == 'huber':
-                param_grid[
-                    f'{options.predictor}__average'
-                ] = CategoricalDistribution((False, True))
+            if options.predictor == 'huber_sgd':
                 param_grid[
                     f'{options.predictor}__tol'
                 ] = UniformDistribution(1e-4, 1e-2)
@@ -440,23 +442,40 @@ def create_model_pipe():
                 ] = UniformDistribution(1e-7, 1e-3)
                 param_grid[
                     f'{options.predictor}__epsilon'
-                ] = UniformDistribution(0, 3 * y.std())
+                ] = UniformDistribution(0, y.std())
 
                 return SGDRegressor(
                     loss='huber',
                     penalty='l2',
-                    max_iter=500,
+                    max_iter=1_000,
                     learning_rate='optimal',
+                    average=True,
+                    early_stopping=True,
+                    validation_fraction=0.1,
+                    n_iter_no_change=10,
 
                     random_state=random_state,
                 )
+
+            elif options.predictor == 'huber_lbfgsb':
+                param_grid[
+                    f'{options.predictor}__epsilon'
+                ] = UniformDistribution(1, 2)
+                param_grid[
+                    f'{options.predictor}__alpha'
+                ] = UniformDistribution(1e-7, 1e-3)
+                param_grid[
+                    f'{options.predictor}__tol'
+                ] = UniformDistribution(1e-4, 1e-1)
+
+                return HuberRegressor(max_iter=1_000)
 
             elif options.predictor == 'ridge':
                 param_grid[
                     f'{options.predictor}__alpha'
                 ] = UniformDistribution(1e-7, 1e-3)
 
-                return Ridge(solver='cholesky')
+                return Ridge(solver='svd')
 
         elif options.task == 'classification':
 
@@ -512,11 +531,11 @@ def create_model_pipe():
     search = OptunaSearchCV(
         pipe,
         param_grid,
-        max_iter=options.n_rounds,
         scoring=get_metric(options.metric_val),
         refit=True,
         cv=inner_cv,
-        n_trials=max(15, options.n_rounds // 10),
+        max_iter=100,
+        n_trials=options.n_rounds,
         random_state=random_state,
         error_score=np.nan,
         return_train_score=False,
